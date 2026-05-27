@@ -3,6 +3,7 @@
 使用 Streamlit + Pandas 開發的每日健康抗老打卡工具。
 """
 
+import math
 import os
 from datetime import date
 
@@ -14,11 +15,37 @@ import streamlit as st
 # ---------------------------------------------------------------------------
 CSV_FILE = "health_and_activity.csv"
 
-# 數值型欄位（缺失時補 0.0）與布林型欄位（缺失時補 False）
+# 欄位分類（決定向後相容時的預設填補值）：
+# 數值型補 0.0、計數型補 0（整數）、布林型補 False
 NUMERIC_COLUMNS = ["Weight", "Sitting_Hours", "Protein_g", "Water_ml"]
-BOOLEAN_COLUMNS = ["Sunscreen_Done", "Good_Sleep_Done"]
-# 完整欄位順序
-ALL_COLUMNS = ["Date"] + NUMERIC_COLUMNS + BOOLEAN_COLUMNS
+COUNT_COLUMNS = ["Active_Breaks_Count"]
+BOOLEAN_COLUMNS = [
+    "Sunscreen_Done",
+    "Good_Sleep_Done",
+    "Face_Exercise_Done",
+    "Lotion_Applied_Done",
+]
+# 完整欄位順序（與 CSV 標頭一致）
+ALL_COLUMNS = [
+    "Date",
+    "Weight",
+    "Sitting_Hours",
+    "Protein_g",
+    "Water_ml",
+    "Sunscreen_Done",
+    "Good_Sleep_Done",
+    "Active_Breaks_Count",
+    "Face_Exercise_Done",
+    "Lotion_Applied_Done",
+]
+
+
+def calc_break_goal(sitting_hours: float) -> int:
+    """
+    依久坐時數計算建議的起來走動次數目標：ceil(久坐時數 × 1.2)。
+    久坐時數為 0 時回傳最低標準 1 次，避免後續達成率計算發生除以零。
+    """
+    return max(1, math.ceil(sitting_hours * 1.2))
 
 
 # ---------------------------------------------------------------------------
@@ -43,6 +70,13 @@ def load_data() -> pd.DataFrame:
             df[col] = 0.0
         else:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+    # 向後相容：補齊缺失的計數欄位（預設 0，整數）
+    for col in COUNT_COLUMNS:
+        if col not in df.columns:
+            df[col] = 0
+        else:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
 
     # 向後相容：補齊缺失的布林欄位（預設 False）
     for col in BOOLEAN_COLUMNS:
@@ -95,6 +129,19 @@ def render_sidebar(df: pd.DataFrame) -> None:
             "今日預估久坐時數", min_value=0.0, max_value=24.0, value=8.0, step=0.5
         )
 
+        # --- 運動與活動（重啟燃脂酶、緊實肌肉） ---
+        st.subheader("運動與活動")
+        # 依久坐時數動態計算建議走動次數目標
+        break_goal = calc_break_goal(sitting_hours)
+        st.caption(
+            f"🎯 今日建議起來走動：{break_goal} 次"
+            "（每 50 分鐘久坐應中斷一次，重啟燃脂酶 LPL）"
+        )
+        active_breaks = st.number_input(
+            "今日起來走動次數", min_value=0, max_value=50, value=0, step=1
+        )
+        face_exercise_done = st.checkbox("今日已完成臉部肌肉拉提運動 🧘‍♀️")
+
         # --- 營養與代謝 ---
         st.subheader("營養與代謝")
         # 依體重動態計算當日目標
@@ -110,10 +157,11 @@ def render_sidebar(df: pd.DataFrame) -> None:
             "今日飲水量 (ml)", min_value=0.0, value=0.0, step=50.0
         )
 
-        # --- 細胞修復 ---
-        st.subheader("細胞修復")
+        # --- 細胞修復與肌膚屏障 ---
+        st.subheader("細胞修復與肌膚屏障")
         sunscreen_done = st.checkbox("今日有確實防曬 (SPF30+ 或物理防曬) ☀️")
         good_sleep_done = st.checkbox("昨晚睡眠大於 7 小時 (細胞修復) 💤")
+        lotion_applied_done = st.checkbox("早晚完成洗臉後乳液鎖水保濕 🧴")
 
         submitted = st.form_submit_button("儲存今日打卡")
 
@@ -126,6 +174,9 @@ def render_sidebar(df: pd.DataFrame) -> None:
             "Water_ml": float(water_ml),
             "Sunscreen_Done": bool(sunscreen_done),
             "Good_Sleep_Done": bool(good_sleep_done),
+            "Active_Breaks_Count": int(active_breaks),
+            "Face_Exercise_Done": bool(face_exercise_done),
+            "Lotion_Applied_Done": bool(lotion_applied_done),
         }
         save_data(df, new_row)
         st.sidebar.success("✅ 今日打卡已儲存！")
@@ -155,7 +206,9 @@ def render_dashboard(df: pd.DataFrame) -> None:
 
     # --- 達成率區塊 ---
     st.header(f"🎯 {latest_date} 打卡達成率")
-    col1, col2, col3, col4 = st.columns(4)
+
+    # 第一排：量化指標（st.metric + 進度條）
+    col1, col2, col3 = st.columns(3)
 
     # 1. 蛋白質
     with col1:
@@ -164,6 +217,7 @@ def render_dashboard(df: pd.DataFrame) -> None:
             label="蛋白質 (g)",
             value=f"{protein:.0f}",
             delta=f"目標 {target_protein:.0f}",
+            delta_color="off",
         )
         # 極重要：以 min(1.0, 比例) 限制進度條最大值，避免 StreamlitAPIException
         protein_ratio = protein / target_protein if target_protein > 0 else 0
@@ -176,25 +230,56 @@ def render_dashboard(df: pd.DataFrame) -> None:
             label="飲水量 (ml)",
             value=f"{water:.0f}",
             delta=f"目標 {target_water:.0f}",
+            delta_color="off",
         )
         # 極重要：限制進度條最大值為 1.0
         water_ratio = water / target_water if target_water > 0 else 0
         st.progress(min(1.0, water_ratio))
 
-    # 3. 防曬抗老
+    # 3. 起來走動次數
     with col3:
-        sunscreen_ok = bool(latest["Sunscreen_Done"])
+        breaks = int(latest["Active_Breaks_Count"])
+        # 依當日久坐時數計算目標（已內建避免除以零的最低值 1）
+        break_goal = calc_break_goal(float(latest["Sitting_Hours"]))
+        st.metric(
+            label="起來走動 (次)",
+            value=f"{breaks}",
+            delta=f"目標 {break_goal}",
+            delta_color="off",
+        )
+        # 極重要：限制進度條最大值為 1.0
+        break_ratio = breaks / break_goal if break_goal > 0 else 0
+        st.progress(min(1.0, break_ratio))
+
+    # 第二排：行為打卡指標（達成 / 未達成）
+    col4, col5, col6, col7 = st.columns(4)
+
+    # 4. 防曬抗老
+    with col4:
         st.metric(
             label="防曬抗老",
-            value="達成 🛡️" if sunscreen_ok else "未達成 ⚠️",
+            value="達成 🛡️" if bool(latest["Sunscreen_Done"]) else "未達成 ⚠️",
         )
 
-    # 4. 深層修復
-    with col4:
-        sleep_ok = bool(latest["Good_Sleep_Done"])
+    # 5. 深層修復
+    with col5:
         st.metric(
             label="深層修復",
-            value="達成 💤" if sleep_ok else "未達成 ⚠️",
+            value="達成 💤" if bool(latest["Good_Sleep_Done"]) else "未達成 ⚠️",
+        )
+
+    # 6. 臉部拉提
+    with col6:
+        st.metric(
+            label="臉部拉提",
+            value="達成 🧘‍♀️" if bool(latest["Face_Exercise_Done"]) else "未達成 ⚠️",
+        )
+
+    # 7. 乳液鎖水
+    with col7:
+        st.metric(
+            label="乳液鎖水",
+            value="達成 🧴" if bool(latest["Lotion_Applied_Done"]) else "未達成 ⚠️",
         )
 
     st.divider()

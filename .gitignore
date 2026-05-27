@@ -1,0 +1,8 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 本地使用者打卡資料（不納入版控）
+health_and_activity.csv

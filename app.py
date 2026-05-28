@@ -9,6 +9,7 @@ from datetime import date
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 # ---------------------------------------------------------------------------
 # 全域設定
@@ -301,6 +302,115 @@ def render_dashboard(df: pd.DataFrame) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 建議臉部運動圖解
+# ---------------------------------------------------------------------------
+# 每項動作以簡易 SVG 臉部示意圖 + 粉色箭頭標示出力/拉提方向，搭配文字步驟。
+# arrows 為箭頭座標清單 (x1, y1, x2, y2)，箭頭由起點指向終點（即出力方向）。
+FACE_EXERCISES = [
+    {
+        "title": "蘋果肌上提（顴大肌 / 顴小肌）",
+        "mouth": "smile",
+        "cheek_fill": "#ffe9d6",
+        "arrows": [(70, 152, 62, 110), (130, 152, 138, 110)],
+        "steps": [
+            "微笑露出上排牙齒，感受蘋果肌自然鼓起。",
+            "雙手食指輕貼蘋果肌最高點，沿箭頭往太陽穴方向輕推。",
+            "維持 5 秒後放鬆，避免用力下壓肌膚。",
+        ],
+        "reps": "10 次 × 2 組",
+    },
+    {
+        "title": "緊實下顎線（頸闊肌）",
+        "mouth": "pout",
+        "cheek_fill": "#ffe9d6",
+        "arrows": [(74, 184, 62, 150), (126, 184, 138, 150)],
+        "steps": [
+            "頭部微抬、視線朝斜上方天花板。",
+            "下唇用力包住上唇，做出「嘟嘴上推」表情。",
+            "感受下巴與頸部繃緊，沿箭頭向上提，維持 5 秒。",
+        ],
+        "reps": "10 次 × 2 組",
+    },
+    {
+        "title": "撫平法令紋（提上唇肌）",
+        "mouth": "wide",
+        "cheek_fill": "#ffe3d0",
+        "arrows": [(86, 150, 80, 120), (114, 150, 120, 120)],
+        "steps": [
+            "鼓起雙頰含住一口空氣。",
+            "將空氣在左右臉頰與上下唇之間緩慢推移。",
+            "每個方向停留 3 秒，撐開法令紋凹陷處。",
+        ],
+        "reps": "10 循環",
+    },
+    {
+        "title": "明亮緊緻眼周（眼輪匝肌）",
+        "mouth": "flat",
+        "cheek_fill": "#ffe9d6",
+        "arrows": [(74, 96, 58, 86), (126, 96, 142, 86)],
+        "steps": [
+            "食指輕壓眼尾、無名指輕貼眼頭固定肌膚。",
+            "用力閉眼 2 秒，再緩緩睜大眼 2 秒。",
+            "全程避免拉扯眼周皮膚，動作輕柔。",
+        ],
+        "reps": "10 次 × 2 組",
+    },
+]
+
+# 不同表情對應的嘴型 SVG 片段
+_MOUTH_SHAPES = {
+    "smile": '<path d="M72 158 Q100 184 128 158" fill="none" stroke="#c0392b" stroke-width="3" stroke-linecap="round"/>',
+    "pout": '<ellipse cx="100" cy="162" rx="13" ry="9" fill="#c0392b"/>',
+    "wide": '<path d="M66 156 Q100 192 134 156" fill="none" stroke="#c0392b" stroke-width="3" stroke-linecap="round"/>',
+    "flat": '<line x1="80" y1="162" x2="120" y2="162" stroke="#c0392b" stroke-width="3" stroke-linecap="round"/>',
+}
+
+
+def _face_svg(uid: str, arrows: list, mouth: str, cheek_fill: str) -> str:
+    """產生單張臉部示意 SVG；uid 確保各圖箭頭 marker 的 id 不衝突。"""
+    lines = "".join(
+        f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="#e84393" '
+        f'stroke-width="3.5" stroke-linecap="round" marker-end="url(#arr{uid})"/>'
+        for (x1, y1, x2, y2) in arrows
+    )
+    return f"""
+<svg xmlns="http://www.w3.org/2000/svg" width="160" height="200" viewBox="0 0 200 240">
+  <defs>
+    <marker id="arr{uid}" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#e84393"/>
+    </marker>
+  </defs>
+  <ellipse cx="100" cy="118" rx="66" ry="90" fill="{cheek_fill}" stroke="#e0a87e" stroke-width="2.5"/>
+  <ellipse cx="76" cy="100" rx="6.5" ry="9" fill="#5d4037"/>
+  <ellipse cx="124" cy="100" rx="6.5" ry="9" fill="#5d4037"/>
+  <path d="M97 112 Q100 132 105 132" fill="none" stroke="#e0a87e" stroke-width="2" stroke-linecap="round"/>
+  {_MOUTH_SHAPES.get(mouth, _MOUTH_SHAPES['smile'])}
+  {lines}
+</svg>"""
+
+
+def render_face_exercise_guide() -> None:
+    """以可展開區塊呈現建議臉部運動的圖解與步驟。"""
+    with st.expander("🧘‍♀️ 建議臉部運動圖解（每日 1 組，由內撐起下垂組織）", expanded=False):
+        st.caption(
+            "依據 JAMA Dermatology (2018) 臉部阻抗運動研究，持續執行可提升中下臉肌肉豐滿度。"
+            "粉色箭頭代表肌肉出力／拉提方向，請以輕柔力道進行，避免過度拉扯肌膚。"
+        )
+        for i, ex in enumerate(FACE_EXERCISES):
+            svg = _face_svg(str(i), ex["arrows"], ex["mouth"], ex["cheek_fill"])
+            col_img, col_txt = st.columns([1, 2])
+            with col_img:
+                components.html(svg, height=210)
+            with col_txt:
+                st.markdown(f"**{ex['title']}**")
+                for step in ex["steps"]:
+                    st.markdown(f"- {step}")
+                st.caption(f"建議頻率：{ex['reps']}")
+            if i < len(FACE_EXERCISES) - 1:
+                st.divider()
+
+
+# ---------------------------------------------------------------------------
 # 程式進入點
 # ---------------------------------------------------------------------------
 def main() -> None:
@@ -313,6 +423,8 @@ def main() -> None:
     df = load_data()
     render_sidebar(df)
     render_dashboard(df)
+    # 臉部運動圖解：空資料或已有紀錄皆顯示，方便隨時參考
+    render_face_exercise_guide()
 
 
 if __name__ == "__main__":

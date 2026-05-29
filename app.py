@@ -696,7 +696,10 @@ def render_wellness_guide() -> None:
 # ---------------------------------------------------------------------------
 GEMINI_MODELS = {
     "gemini-2.5-flash": "Gemini 2.5 Flash（快速、預設）",
+    "gemini-2.5-flash-lite": "Gemini 2.5 Flash Lite（最快、最便宜）",
     "gemini-2.5-pro": "Gemini 2.5 Pro（深度回答、較慢）",
+    "gemini-2.0-flash": "Gemini 2.0 Flash（穩定備援）",
+    "gemini-2.0-flash-lite": "Gemini 2.0 Flash Lite（輕量備援）",
 }
 
 GEMINI_SYSTEM_PROMPT = """你是一位專精「健康減重」與「抗老化」的繁體中文 AI 顧問。
@@ -1180,23 +1183,32 @@ def render_ai_advisor(df: pd.DataFrame) -> None:
             st.rerun()
         return
 
-    # --- 有 API Key 候選：必要時讓使用者挑選要使用的 Key ---
+    # --- Key 候選：預設自動使用首把 + 自動 fallback；手動指定收進進階展開器 ---
     label_to_value = {lbl: val for lbl, val in candidates}
+    labels = [lbl for lbl, _ in candidates]
+    prev = st.session_state.get("_gemini_key_label")
+    default_idx = labels.index(prev) if prev in labels else 0
+    chosen_label = labels[default_idx]
+
     if len(candidates) > 1:
-        labels = [lbl for lbl, _ in candidates]
-        prev = st.session_state.get("_gemini_key_label")
-        default_idx = labels.index(prev) if prev in labels else 0
-        chosen_label = st.selectbox(
-            f"🔑 Gemini Key 來源（偵測到 {len(candidates)} 把 Key，可任意切換）",
-            labels,
-            index=default_idx,
-            format_func=lambda lbl: f"{lbl}　→　{_mask_key(label_to_value[lbl])}",
-        )
-        st.session_state["_gemini_key_label"] = chosen_label
-    else:
-        chosen_label = candidates[0][0]
         st.caption(
-            f"🔑 使用的 Key 來源：`{chosen_label}`　→　`{_mask_key(label_to_value[chosen_label])}`"
+            f"🔑 偵測到 **{len(candidates)} 把 Key**；目前優先使用 "
+            f"`{chosen_label}`（{_mask_key(label_to_value[chosen_label])}）。"
+            "配額耗盡或 Key 失效時會自動切換到下一把，**無需手動操作**。"
+        )
+        with st.expander("🔧 進階：手動指定要優先使用哪一把 Key", expanded=False):
+            picked = st.selectbox(
+                "Key 來源",
+                labels,
+                index=default_idx,
+                format_func=lambda lbl: f"{lbl}　→　{_mask_key(label_to_value[lbl])}",
+            )
+            if picked != chosen_label:
+                st.session_state["_gemini_key_label"] = picked
+                chosen_label = picked
+    else:
+        st.caption(
+            f"🔑 使用的 Key 來源：`{chosen_label}`（{_mask_key(label_to_value[chosen_label])}）"
         )
     api_key = label_to_value[chosen_label]
 
@@ -1264,6 +1276,9 @@ def render_ai_advisor(df: pd.DataFrame) -> None:
                     f"_（🔁 `{chosen_label}` 失敗，已自動切換到 `{result['label_used']}`）_\n\n"
                     + reply
                 )
+            # 成功時記住可用 Key，下次直接從這把開始，避免反覆 burn 已失效的
+            if result["final_class"] is None and result["label_used"]:
+                st.session_state["_gemini_key_label"] = result["label_used"]
             st.markdown(reply)
             # 透明化：列出所有重試／切換嘗試與分類
             if result["attempts"]:

@@ -724,8 +724,54 @@ GEMINI_KEY_NAMES = (
 )
 
 
-def _scan_secrets_for_key() -> tuple[str | None, dict]:
-    """掃描 st.secrets 中可能的 Gemini Key（含巢狀 section），並回傳診斷資訊。"""
+def _mask_key(k: str) -> str:
+    """以遮罩方式顯示 Key 字串，避免完整曝光。"""
+    if not k:
+        return "(空字串)"
+    n = len(k)
+    if n <= 8:
+        return "•" * n
+    return f"{k[:4]}…{k[-4:]}"
+
+
+def _is_geminiish_name(name: str) -> bool:
+    """判斷一個變數名稱是否屬於 Gemini Key 系列（含複數 KEYS、編號後綴 _1 等）。"""
+    upper = name.upper()
+    for base in GEMINI_KEY_NAMES:
+        b = base.upper()
+        if upper == b or upper == b + "S" or upper.startswith(b + "_"):
+            return True
+    return False
+
+
+def _collect_candidates(mapping, container_label: str = "") -> list[tuple[str, str]]:
+    """從 mapping（st.secrets 或 section）擷取所有符合命名的字串／字串陣列值。"""
+    out: list[tuple[str, str]] = []
+    try:
+        keys = list(mapping.keys())
+    except Exception:
+        return out
+    prefix = f"{container_label}." if container_label else ""
+    for k in keys:
+        if not _is_geminiish_name(k):
+            continue
+        try:
+            val = mapping[k]
+        except Exception:
+            continue
+        if isinstance(val, str):
+            if val.strip():
+                out.append((f"{prefix}{k}", val.strip()))
+        elif isinstance(val, (list, tuple)):
+            for i, item in enumerate(val):
+                if isinstance(item, str) and item.strip():
+                    out.append((f"{prefix}{k}[{i}]", item.strip()))
+        # dict-like 值會在 caller 的巢狀掃描中處理
+    return out
+
+
+def _scan_secrets_for_candidates() -> tuple[list[tuple[str, str]], dict]:
+    """掃描 st.secrets 的所有 Gemini Key 候選（頂層 + 巢狀 section），回傳 (候選清單, 診斷)。"""
     cwd = os.getcwd()
     project_path = os.path.join(cwd, ".streamlit", "secrets.toml")
     home_path = os.path.expanduser("~/.streamlit/secrets.toml")
@@ -739,67 +785,82 @@ def _scan_secrets_for_key() -> tuple[str | None, dict]:
         "top_level_keys": [],
         "nested_sections": {},
     }
+    candidates: list[tuple[str, str]] = []
     try:
         top_keys = list(st.secrets.keys())
         diag["top_level_keys"] = top_keys
-
-        # 1. 頂層命中：GEMINI_API_KEY = "..."
-        for name in GEMINI_KEY_NAMES:
-            if name in st.secrets:
-                val = st.secrets[name]
-                if isinstance(val, str) and val.strip():
-                    return val, diag
-
-        # 2. 巢狀掃描：[gemini] api_key = "..." 之類
+        # 1. 頂層
+        candidates.extend(_collect_candidates(st.secrets))
+        # 2. 巢狀 section
         for k in top_keys:
             try:
                 section = st.secrets[k]
-                if hasattr(section, "keys"):
+                if hasattr(section, "keys") and not isinstance(section, (str, bytes)):
                     sub_keys = list(section.keys())
                     diag["nested_sections"][k] = sub_keys
-                    for name in GEMINI_KEY_NAMES + ("api_key", "API_KEY"):
-                        if name in section:
-                            val = section[name]
-                            if isinstance(val, str) and val.strip():
-                                return val, diag
+                    # ① section 內也按命名規則掃
+                    candidates.extend(_collect_candidates(section, container_label=k))
+                    # ② section 名稱本身就和 gemini/google 有關時，額外接受泛用名
+                    if k.lower() in (
+                        "gemini", "google", "google_gemini", "google_ai", "ai", "llm",
+                    ):
+                        for inner in sub_keys:
+                            if inner.lower() in ("api_key", "key", "secret", "keys"):
+                                v = section[inner]
+                                if isinstance(v, str) and v.strip():
+                                    candidates.append((f"{k}.{inner}", v.strip()))
+                                elif isinstance(v, (list, tuple)):
+                                    for i, item in enumerate(v):
+                                        if isinstance(item, str) and item.strip():
+                                            candidates.append(
+                                                (f"{k}.{inner}[{i}]", item.strip())
+                                            )
             except Exception:
                 continue
     except Exception as e:
         diag["secrets_load_error"] = f"{type(e).__name__}: {e}"
-    return None, diag
+    return candidates, diag
 
 
-def _get_gemini_api_key() -> tuple[str | None, dict]:
-    """依優先順序取得 API Key（session 手動 → st.secrets → 環境變數），並回傳診斷資訊。"""
-    diag: dict = {
-        "source": None,
-        "session_set": False,
-        "env_checked": list(GEMINI_KEY_NAMES),
-        "secrets": {},
-    }
+def _collect_env_candidates() -> list[tuple[str, str]]:
+    """從 os.environ 擷取 Gemini Key 候選（含 GEMINI_API_KEY_1 等變體）。"""
+    out: list[tuple[str, str]] = []
+    for k, v in os.environ.items():
+        if not isinstance(v, str) or not v.strip():
+            continue
+        if _is_geminiish_name(k):
+            out.append((f"env:{k}", v.strip()))
+    return out
 
-    # 1. session 手動輸入（同一次瀏覽 session 內）
+
+def _get_gemini_candidates() -> tuple[list[tuple[str, str]], dict]:
+    """聚合所有 Gemini Key 候選並回傳診斷。
+    順序：session 手動輸入 → st.secrets → 環境變數；重複 Key 值僅保留首次出現。"""
+    diag: dict = {"session_set": False, "secrets": {}, "env_count": 0}
+    raw: list[tuple[str, str]] = []
+
     manual = st.session_state.get("_gemini_key_manual")
     if manual:
         diag["session_set"] = True
-        diag["source"] = "session"
-        return manual, diag
+        raw.append(("session(手動輸入)", manual))
 
-    # 2. st.secrets
-    key, sdiag = _scan_secrets_for_key()
+    secrets_cands, sdiag = _scan_secrets_for_candidates()
     diag["secrets"] = sdiag
-    if key:
-        diag["source"] = "st.secrets"
-        return key, diag
+    raw.extend([(f"secrets:{l}", v) for l, v in secrets_cands])
 
-    # 3. 環境變數
-    for name in GEMINI_KEY_NAMES:
-        v = os.environ.get(name)
-        if v and v.strip():
-            diag["source"] = f"env:{name}"
-            return v, diag
+    env_cands = _collect_env_candidates()
+    diag["env_count"] = len(env_cands)
+    raw.extend(env_cands)
 
-    return None, diag
+    # 依 Key 值去重，保留第一筆
+    seen: set[str] = set()
+    unique: list[tuple[str, str]] = []
+    for lbl, val in raw:
+        if val in seen:
+            continue
+        seen.add(val)
+        unique.append((lbl, val))
+    return unique, diag
 
 
 def _build_user_context(df: pd.DataFrame) -> str:
@@ -862,10 +923,10 @@ def render_ai_advisor(df: pd.DataFrame) -> None:
         "AI 可能出錯，請以個人健康狀況與專業意見為準。"
     )
 
-    api_key, diag = _get_gemini_api_key()
+    candidates, diag = _get_gemini_candidates()
 
     # --- 未設定 API Key：引導設定 + 顯示診斷 ---
-    if not api_key:
+    if not candidates:
         st.info(
             "🔑 尚未設定 Gemini API Key。可任選下列其一：\n\n"
             "- 在 `.streamlit/secrets.toml` 加入 `GEMINI_API_KEY = \"...\"`（推薦）\n"
@@ -918,7 +979,8 @@ def render_ai_advisor(df: pd.DataFrame) -> None:
                     "或放在 `~/.streamlit/secrets.toml`，並重啟 Streamlit。"
                 )
             st.markdown(
-                f"- **檢查過的環境變數名稱**：`{diag.get('env_checked')}`（皆未設定或為空）"
+                f"- **檢查過的環境變數**：嘗試名稱包含 `{list(GEMINI_KEY_NAMES)}`、"
+                f"`*_S`（複數）與 `*_<suffix>`（編號）；找到 `{diag.get('env_count', 0)}` 個"
             )
 
         with st.expander("如何取得 Gemini API Key？"):
@@ -939,7 +1001,27 @@ def render_ai_advisor(df: pd.DataFrame) -> None:
             st.rerun()
         return
 
-    # --- 有 API Key：模型選擇 + 對話介面 ---
+    # --- 有 API Key 候選：必要時讓使用者挑選要使用的 Key ---
+    label_to_value = {lbl: val for lbl, val in candidates}
+    if len(candidates) > 1:
+        labels = [lbl for lbl, _ in candidates]
+        prev = st.session_state.get("_gemini_key_label")
+        default_idx = labels.index(prev) if prev in labels else 0
+        chosen_label = st.selectbox(
+            f"🔑 Gemini Key 來源（偵測到 {len(candidates)} 把 Key，可任意切換）",
+            labels,
+            index=default_idx,
+            format_func=lambda lbl: f"{lbl}　→　{_mask_key(label_to_value[lbl])}",
+        )
+        st.session_state["_gemini_key_label"] = chosen_label
+    else:
+        chosen_label = candidates[0][0]
+        st.caption(
+            f"🔑 使用的 Key 來源：`{chosen_label}`　→　`{_mask_key(label_to_value[chosen_label])}`"
+        )
+    api_key = label_to_value[chosen_label]
+
+    # --- 模型選擇 + 對話介面 ---
     top_cols = st.columns([3, 1, 1])
     with top_cols[0]:
         model_label = st.selectbox(

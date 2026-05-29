@@ -955,6 +955,144 @@ def _call_gemini(
     return response.text or "（AI 未能生成回應，請重試或換個問題。）"
 
 
+# ---- 錯誤分類與自動換 Key ----
+_ERROR_LABELS = {
+    "KEY_INVALID": "Key 無效 (400)",
+    "QUOTA": "配額耗盡 (429)",
+    "KEY_NO_PERMISSION": "Key 無權限 (403)",
+    "MODEL_OVERLOAD": "模型忙線 (503)",
+    "MODEL_INTERNAL": "伺服器內部錯誤 (500)",
+    "OTHER": "其他錯誤",
+}
+# 換 Key 才有用的錯誤類別（屬於這把 Key 本身的問題）
+_KEY_SWITCH_CLASSES = {"QUOTA", "KEY_INVALID", "KEY_NO_PERMISSION"}
+# 屬於 Google 端模型/伺服器暫時錯誤；換 Key 無效，僅同 Key 重試 1 次
+_RETRY_SAME_KEY_CLASSES = {"MODEL_OVERLOAD", "MODEL_INTERNAL"}
+
+
+def _classify_gemini_error(exc: Exception) -> str:
+    """依錯誤訊息分類 Gemini 失敗類型，決定後續處置。"""
+    s = str(exc).upper()
+    if "API_KEY_INVALID" in s or "API KEY NOT VALID" in s:
+        return "KEY_INVALID"
+    if "RESOURCE_EXHAUSTED" in s or "QUOTA" in s or " 429" in s or "'CODE': 429" in s:
+        return "QUOTA"
+    if "PERMISSION_DENIED" in s or " 403" in s or "'CODE': 403" in s:
+        return "KEY_NO_PERMISSION"
+    if "UNAVAILABLE" in s or " 503" in s or "'CODE': 503" in s:
+        return "MODEL_OVERLOAD"
+    if " 500" in s or "'CODE': 500" in s or "INTERNAL" in s:
+        return "MODEL_INTERNAL"
+    return "OTHER"
+
+
+def _fmt_model_overload(model: str, klass: str) -> str:
+    if klass == "MODEL_OVERLOAD":
+        return (
+            f"⏳ **`{model}` 模型目前忙線中（503 UNAVAILABLE）**\n\n"
+            "這是 **Google 端模型過載**，與你的 API Key 或配額**無關**，"
+            "因此自動切換 Key 也救不了（相同模型不論用哪把 Key 都受同一波負載影響）。\n\n"
+            "建議處理：\n"
+            "- 稍等 30–60 秒後重新送出問題\n"
+            "- 切換到另一個模型（上方下拉改選 Gemini 2.5 Pro 或回到 Flash）"
+        )
+    return (
+        f"⚠️ **`{model}` 伺服器內部錯誤（500 INTERNAL）**\n\n"
+        "Google 端內部錯誤，與你的 Key 無關。請稍後重試或改用其他模型。"
+    )
+
+
+def _fmt_unknown_error(e: Exception) -> str:
+    return (
+        f"❌ 呼叫 Gemini API 失敗：`{type(e).__name__}: {str(e)[:300]}`\n\n"
+        "未能歸類的錯誤；請檢查網路或稍後再試。"
+    )
+
+
+def _fmt_all_failed(attempts: list[dict]) -> str:
+    lines = ["❌ **所有可用的 API Key 都嘗試失敗**", "", "嘗試紀錄："]
+    for a in attempts:
+        lines.append(f"- `{a['label']}` → {_ERROR_LABELS.get(a['class'], a['class'])}")
+    lines.append("")
+    lines.append(
+        "請到 https://aistudio.google.com/apikey 確認 Key 狀態與配額，"
+        "或到 Google Cloud Console 檢查專案是否被停用。"
+    )
+    return "\n".join(lines)
+
+
+def _call_gemini_with_fallback(
+    candidates: list[tuple[str, str]],
+    starting_label: str,
+    model: str,
+    history: list,
+    user_context: str,
+) -> dict:
+    """依候選 Key 列表呼叫 Gemini，必要時自動換 Key。
+
+    處置策略：
+    - QUOTA / KEY_INVALID / KEY_NO_PERMISSION：屬於 Key 本身問題 → 換下一把
+    - MODEL_OVERLOAD / MODEL_INTERNAL：屬於 Google 端 → 同 Key 等待後重試 1 次；
+      仍失敗則不換 Key（換了無效），直接回報模型/伺服器忙線
+    - OTHER：立即回報，不浪費其他 Key
+    """
+    import time
+
+    # 從使用者選定的 Key 開始，其餘依候選順序作為備援
+    ordered = [(l, v) for l, v in candidates if l == starting_label]
+    ordered += [(l, v) for l, v in candidates if l != starting_label]
+
+    attempts: list[dict] = []
+
+    for label, api_key in ordered:
+        try:
+            reply = _call_gemini(api_key, model, history, user_context)
+            return {"reply": reply, "label_used": label, "attempts": attempts, "final_class": None}
+        except ModuleNotFoundError:
+            return {
+                "reply": "❌ 尚未安裝 Gemini 套件。請執行 `pip install google-genai` 後重啟應用程式。",
+                "label_used": None,
+                "attempts": attempts,
+                "final_class": "MODULE_MISSING",
+            }
+        except Exception as e:
+            klass = _classify_gemini_error(e)
+            attempts.append({"label": label, "class": klass, "raw": str(e)[:300]})
+
+            if klass in _RETRY_SAME_KEY_CLASSES:
+                # 換 Key 無效；同 Key 等 2 秒重試 1 次
+                time.sleep(2)
+                try:
+                    reply = _call_gemini(api_key, model, history, user_context)
+                    return {"reply": reply, "label_used": label, "attempts": attempts, "final_class": None}
+                except Exception as e2:
+                    klass2 = _classify_gemini_error(e2)
+                    attempts.append({"label": label, "class": klass2, "raw": str(e2)[:300]})
+                    return {
+                        "reply": _fmt_model_overload(model, klass2),
+                        "label_used": label,
+                        "attempts": attempts,
+                        "final_class": klass2,
+                    }
+            elif klass in _KEY_SWITCH_CLASSES:
+                continue  # 換下一把 Key
+            else:
+                return {
+                    "reply": _fmt_unknown_error(e),
+                    "label_used": label,
+                    "attempts": attempts,
+                    "final_class": klass,
+                }
+
+    # 全部候選都失敗
+    return {
+        "reply": _fmt_all_failed(attempts),
+        "label_used": None,
+        "attempts": attempts,
+        "final_class": "ALL_FAILED",
+    }
+
+
 def render_ai_advisor(df: pd.DataFrame) -> None:
     """AI 抗老減重顧問對話介面（使用 Google Gemini API）。"""
     st.divider()
@@ -1108,24 +1246,35 @@ def render_ai_advisor(df: pd.DataFrame) -> None:
 
         with st.chat_message("assistant"):
             with st.spinner("AI 思考中..."):
-                try:
-                    reply = _call_gemini(
-                        api_key,
-                        model_label,
-                        st.session_state["ai_history"],
-                        _build_user_context(df),
-                    )
-                except ModuleNotFoundError:
-                    reply = (
-                        "❌ 尚未安裝 Gemini 套件。請執行：`pip install google-genai`"
-                        " 後重啟應用程式。"
-                    )
-                except Exception as e:
-                    reply = (
-                        f"❌ 呼叫 Gemini API 失敗：`{type(e).__name__}: {e}`\n\n"
-                        "請檢查 API Key 是否正確、網路連線、配額是否足夠，或稍後再試。"
-                    )
+                result = _call_gemini_with_fallback(
+                    candidates,
+                    chosen_label,
+                    model_label,
+                    st.session_state["ai_history"],
+                    _build_user_context(df),
+                )
+            reply = result["reply"]
+            # 若實際成功使用的 Key 與選定不同，顯著標註發生過自動切換
+            if (
+                result["label_used"]
+                and result["label_used"] != chosen_label
+                and result["final_class"] is None
+            ):
+                reply = (
+                    f"_（🔁 `{chosen_label}` 失敗，已自動切換到 `{result['label_used']}`）_\n\n"
+                    + reply
+                )
             st.markdown(reply)
+            # 透明化：列出所有重試／切換嘗試與分類
+            if result["attempts"]:
+                with st.expander(
+                    f"🔍 自動切換／重試紀錄（{len(result['attempts'])} 次）"
+                ):
+                    for a in result["attempts"]:
+                        st.markdown(
+                            f"- `{a['label']}` → **{_ERROR_LABELS.get(a['class'], a['class'])}**"
+                        )
+                        st.caption(a["raw"])
 
         st.session_state["ai_history"].append(
             {"role": "assistant", "content": reply}

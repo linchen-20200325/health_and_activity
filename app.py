@@ -5,6 +5,7 @@
 
 import math
 import os
+import re
 from datetime import date
 
 import pandas as pd
@@ -734,6 +735,16 @@ def _mask_key(k: str) -> str:
     return f"{k[:4]}…{k[-4:]}"
 
 
+# Gemini Key 本身不含逗號／分號／pipe／空白／換行，因此可用這些當分隔符
+# 把「多把 Key 串成一個字串」（例如 "k1, k2, k3"）拆回多個候選
+_KEY_SPLIT_RE = re.compile(r"[,;|\s]+")
+
+
+def _split_key_string(val: str) -> list[str]:
+    """以常見分隔符拆解可能包含多把 Key 的字串，過濾空字串。"""
+    return [p for p in _KEY_SPLIT_RE.split(val.strip()) if p]
+
+
 def _is_geminiish_name(name: str) -> bool:
     """判斷一個變數名稱是否屬於 Gemini Key 系列（含複數 KEYS、編號後綴 _1 等）。"""
     upper = name.upper()
@@ -760,12 +771,23 @@ def _collect_candidates(mapping, container_label: str = "") -> list[tuple[str, s
         except Exception:
             continue
         if isinstance(val, str):
-            if val.strip():
-                out.append((f"{prefix}{k}", val.strip()))
+            parts = _split_key_string(val)
+            if len(parts) == 1:
+                out.append((f"{prefix}{k}", parts[0]))
+            elif len(parts) > 1:
+                # 多把 Key 串接在一個字串內：拆成多筆候選
+                for i, p in enumerate(parts, start=1):
+                    out.append((f"{prefix}{k}#{i}", p))
         elif isinstance(val, (list, tuple)):
             for i, item in enumerate(val):
-                if isinstance(item, str) and item.strip():
-                    out.append((f"{prefix}{k}[{i}]", item.strip()))
+                if not isinstance(item, str):
+                    continue
+                parts = _split_key_string(item)
+                if len(parts) == 1:
+                    out.append((f"{prefix}{k}[{i}]", parts[0]))
+                else:
+                    for j, p in enumerate(parts, start=1):
+                        out.append((f"{prefix}{k}[{i}]#{j}", p))
         # dict-like 值會在 caller 的巢狀掃描中處理
     return out
 
@@ -807,14 +829,27 @@ def _scan_secrets_for_candidates() -> tuple[list[tuple[str, str]], dict]:
                         for inner in sub_keys:
                             if inner.lower() in ("api_key", "key", "secret", "keys"):
                                 v = section[inner]
-                                if isinstance(v, str) and v.strip():
-                                    candidates.append((f"{k}.{inner}", v.strip()))
+                                if isinstance(v, str):
+                                    parts = _split_key_string(v)
+                                    if len(parts) == 1:
+                                        candidates.append((f"{k}.{inner}", parts[0]))
+                                    elif len(parts) > 1:
+                                        for j, p in enumerate(parts, start=1):
+                                            candidates.append((f"{k}.{inner}#{j}", p))
                                 elif isinstance(v, (list, tuple)):
                                     for i, item in enumerate(v):
-                                        if isinstance(item, str) and item.strip():
+                                        if not isinstance(item, str):
+                                            continue
+                                        parts = _split_key_string(item)
+                                        if len(parts) == 1:
                                             candidates.append(
-                                                (f"{k}.{inner}[{i}]", item.strip())
+                                                (f"{k}.{inner}[{i}]", parts[0])
                                             )
+                                        else:
+                                            for j, p in enumerate(parts, start=1):
+                                                candidates.append(
+                                                    (f"{k}.{inner}[{i}]#{j}", p)
+                                                )
             except Exception:
                 continue
     except Exception as e:
@@ -823,13 +858,19 @@ def _scan_secrets_for_candidates() -> tuple[list[tuple[str, str]], dict]:
 
 
 def _collect_env_candidates() -> list[tuple[str, str]]:
-    """從 os.environ 擷取 Gemini Key 候選（含 GEMINI_API_KEY_1 等變體）。"""
+    """從 os.environ 擷取 Gemini Key 候選（含 GEMINI_API_KEY_1 等變體；支援多 Key 串接）。"""
     out: list[tuple[str, str]] = []
     for k, v in os.environ.items():
         if not isinstance(v, str) or not v.strip():
             continue
-        if _is_geminiish_name(k):
-            out.append((f"env:{k}", v.strip()))
+        if not _is_geminiish_name(k):
+            continue
+        parts = _split_key_string(v)
+        if len(parts) == 1:
+            out.append((f"env:{k}", parts[0]))
+        elif len(parts) > 1:
+            for i, p in enumerate(parts, start=1):
+                out.append((f"env:{k}#{i}", p))
     return out
 
 

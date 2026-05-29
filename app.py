@@ -715,17 +715,91 @@ GEMINI_SYSTEM_PROMPT = """你是一位專精「健康減重」與「抗老化」
 """
 
 
-def _get_gemini_api_key() -> str | None:
-    """依優先順序取得 API Key：session 手動輸入 → st.secrets → 環境變數。"""
-    if st.session_state.get("_gemini_key_manual"):
-        return st.session_state["_gemini_key_manual"]
+# Gemini Key 在 secrets/env 中常見的變數名稱（涵蓋大小寫與相似命名）
+GEMINI_KEY_NAMES = (
+    "GEMINI_API_KEY",
+    "gemini_api_key",
+    "GOOGLE_API_KEY",
+    "google_api_key",
+)
+
+
+def _scan_secrets_for_key() -> tuple[str | None, dict]:
+    """掃描 st.secrets 中可能的 Gemini Key（含巢狀 section），並回傳診斷資訊。"""
+    cwd = os.getcwd()
+    project_path = os.path.join(cwd, ".streamlit", "secrets.toml")
+    home_path = os.path.expanduser("~/.streamlit/secrets.toml")
+    diag: dict = {
+        "cwd": cwd,
+        "project_secrets_path": project_path,
+        "project_secrets_exists": os.path.exists(project_path),
+        "home_secrets_path": home_path,
+        "home_secrets_exists": os.path.exists(home_path),
+        "secrets_load_error": None,
+        "top_level_keys": [],
+        "nested_sections": {},
+    }
     try:
-        if "GEMINI_API_KEY" in st.secrets:
-            return st.secrets["GEMINI_API_KEY"]
-    except Exception:
-        # st.secrets 在無 secrets.toml 時會拋例外，忽略後續備援
-        pass
-    return os.environ.get("GEMINI_API_KEY")
+        top_keys = list(st.secrets.keys())
+        diag["top_level_keys"] = top_keys
+
+        # 1. 頂層命中：GEMINI_API_KEY = "..."
+        for name in GEMINI_KEY_NAMES:
+            if name in st.secrets:
+                val = st.secrets[name]
+                if isinstance(val, str) and val.strip():
+                    return val, diag
+
+        # 2. 巢狀掃描：[gemini] api_key = "..." 之類
+        for k in top_keys:
+            try:
+                section = st.secrets[k]
+                if hasattr(section, "keys"):
+                    sub_keys = list(section.keys())
+                    diag["nested_sections"][k] = sub_keys
+                    for name in GEMINI_KEY_NAMES + ("api_key", "API_KEY"):
+                        if name in section:
+                            val = section[name]
+                            if isinstance(val, str) and val.strip():
+                                return val, diag
+            except Exception:
+                continue
+    except Exception as e:
+        diag["secrets_load_error"] = f"{type(e).__name__}: {e}"
+    return None, diag
+
+
+def _get_gemini_api_key() -> tuple[str | None, dict]:
+    """依優先順序取得 API Key（session 手動 → st.secrets → 環境變數），並回傳診斷資訊。"""
+    diag: dict = {
+        "source": None,
+        "session_set": False,
+        "env_checked": list(GEMINI_KEY_NAMES),
+        "secrets": {},
+    }
+
+    # 1. session 手動輸入（同一次瀏覽 session 內）
+    manual = st.session_state.get("_gemini_key_manual")
+    if manual:
+        diag["session_set"] = True
+        diag["source"] = "session"
+        return manual, diag
+
+    # 2. st.secrets
+    key, sdiag = _scan_secrets_for_key()
+    diag["secrets"] = sdiag
+    if key:
+        diag["source"] = "st.secrets"
+        return key, diag
+
+    # 3. 環境變數
+    for name in GEMINI_KEY_NAMES:
+        v = os.environ.get(name)
+        if v and v.strip():
+            diag["source"] = f"env:{name}"
+            return v, diag
+
+    return None, diag
 
 
 def _build_user_context(df: pd.DataFrame) -> str:
@@ -788,25 +862,74 @@ def render_ai_advisor(df: pd.DataFrame) -> None:
         "AI 可能出錯，請以個人健康狀況與專業意見為準。"
     )
 
-    api_key = _get_gemini_api_key()
+    api_key, diag = _get_gemini_api_key()
 
-    # --- 未設定 API Key：引導設定 ---
+    # --- 未設定 API Key：引導設定 + 顯示診斷 ---
     if not api_key:
         st.info(
             "🔑 尚未設定 Gemini API Key。可任選下列其一：\n\n"
+            "- 在 `.streamlit/secrets.toml` 加入 `GEMINI_API_KEY = \"...\"`（推薦）\n"
             "- 設定環境變數 `GEMINI_API_KEY`\n"
-            "- 在 `.streamlit/secrets.toml` 加入 `GEMINI_API_KEY = \"...\"`\n"
             "- 或於下方欄位貼上 API Key（僅儲存於目前瀏覽器 session）"
         )
+
+        # 診斷：協助使用者判斷 secrets 為何讀不到
+        with st.expander("🔍 為何 secrets 沒被讀到？（診斷資訊）", expanded=True):
+            s = diag.get("secrets", {})
+            st.markdown(f"- **目前工作目錄**：`{s.get('cwd')}`")
+            st.markdown(
+                f"- **專案層 secrets.toml**：`{s.get('project_secrets_path')}`　"
+                f"{'✅ 存在' if s.get('project_secrets_exists') else '❌ 不存在'}"
+            )
+            st.markdown(
+                f"- **使用者層 secrets.toml**：`{s.get('home_secrets_path')}`　"
+                f"{'✅ 存在' if s.get('home_secrets_exists') else '❌ 不存在'}"
+            )
+            if s.get("secrets_load_error"):
+                st.error(
+                    f"⚠️ 載入 secrets 失敗：`{s['secrets_load_error']}`"
+                    "（請檢查 TOML 語法，例如字串是否以雙引號包住）"
+                )
+            if s.get("top_level_keys"):
+                st.markdown(f"- **secrets 內偵測到的頂層鍵**：`{s['top_level_keys']}`")
+            if s.get("nested_sections"):
+                st.markdown(f"- **巢狀 section 內的鍵**：`{s['nested_sections']}`")
+            if (
+                (s.get("project_secrets_exists") or s.get("home_secrets_exists"))
+                and not s.get("secrets_load_error")
+                and (s.get("top_level_keys") or s.get("nested_sections"))
+            ):
+                st.warning(
+                    "📌 secrets.toml 有讀到，但找不到符合名稱的 Gemini Key。"
+                    f"已嘗試的鍵名：`{list(GEMINI_KEY_NAMES)}`（含巢狀 section 的 `api_key`）。"
+                    "請確認 `.streamlit/secrets.toml` 內有下列其中一種寫法："
+                )
+                st.code(
+                    'GEMINI_API_KEY = "你的 Key 字串"\n'
+                    "\n# 或巢狀寫法：\n"
+                    "[gemini]\n"
+                    'api_key = "你的 Key 字串"',
+                    language="toml",
+                )
+            elif not (s.get("project_secrets_exists") or s.get("home_secrets_exists")):
+                st.warning(
+                    "📌 兩個位置都沒有 secrets.toml。請把檔案放在「執行 "
+                    "`streamlit run` 的資料夾」下的 `.streamlit/secrets.toml`，"
+                    "或放在 `~/.streamlit/secrets.toml`，並重啟 Streamlit。"
+                )
+            st.markdown(
+                f"- **檢查過的環境變數名稱**：`{diag.get('env_checked')}`（皆未設定或為空）"
+            )
+
         with st.expander("如何取得 Gemini API Key？"):
             st.markdown(
                 "1. 前往 Google AI Studio：https://aistudio.google.com/apikey\n"
                 "2. 以 Google 帳號登入後點選「Create API key」\n"
-                "3. 複製產生的 Key，貼到下方欄位即可開始對話\n\n"
+                "3. 複製產生的 Key 後，貼到下方欄位或寫進 secrets.toml\n\n"
                 "免費方案有每日使用額度，正式商用請評估付費方案。"
             )
         manual_key = st.text_input(
-            "Gemini API Key",
+            "Gemini API Key（手動輸入備援）",
             type="password",
             key="_gemini_key_input",
             placeholder="貼上 API Key 後按 Enter 送出",

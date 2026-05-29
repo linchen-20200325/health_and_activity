@@ -691,6 +691,202 @@ def render_wellness_guide() -> None:
 
 
 # ---------------------------------------------------------------------------
+# AI 抗老減重顧問（Google Gemini）
+# ---------------------------------------------------------------------------
+GEMINI_MODELS = {
+    "gemini-2.5-flash": "Gemini 2.5 Flash（快速、預設）",
+    "gemini-2.5-pro": "Gemini 2.5 Pro（深度回答、較慢）",
+}
+
+GEMINI_SYSTEM_PROMPT = """你是一位專精「健康減重」與「抗老化」的繁體中文 AI 顧問。
+
+請依下列原則回答使用者問題：
+1. 語言風格：全程繁體中文，親切、條理清晰，善用小標題與條列方便閱讀。
+2. 實證導向：以實證醫學、營養科學與運動科學為基礎；避免推薦極端節食、未經證實的偏方、藥物濫用或快速減重產品。
+3. 整體生活型態：回答中盡量同時涵蓋「飲食、運動、睡眠、壓力管理、肌膚／姿勢」面向。
+4. 可執行步驟：適時提供具體可量化的建議（例如：每日蛋白質克數、運動組數次數、食物份量、入睡時間）。
+5. 醫療界線：若問題涉及疾病、用藥、孕哺、嚴重肥胖或極端體重變化，請明確建議諮詢醫師、營養師或物理治療師。
+6. 個人化：若提供使用者最新打卡資料，請結合資料給出客製化建議；資料缺失時禮貌詢問或先給通用建議。
+
+建議回答格式：
+- 開頭以 1–2 句總結重點。
+- 中段以小標題分段（例如：飲食原則／運動安排／睡眠調整／注意事項）。
+- 結尾附 1 行重要提醒（如必要再諮詢專業）。
+"""
+
+
+def _get_gemini_api_key() -> str | None:
+    """依優先順序取得 API Key：session 手動輸入 → st.secrets → 環境變數。"""
+    if st.session_state.get("_gemini_key_manual"):
+        return st.session_state["_gemini_key_manual"]
+    try:
+        if "GEMINI_API_KEY" in st.secrets:
+            return st.secrets["GEMINI_API_KEY"]
+    except Exception:
+        # st.secrets 在無 secrets.toml 時會拋例外，忽略後續備援
+        pass
+    return os.environ.get("GEMINI_API_KEY")
+
+
+def _build_user_context(df: pd.DataFrame) -> str:
+    """將使用者最新一筆打卡資料整理為文字摘要，供 AI 個人化使用。"""
+    if df.empty:
+        return "（使用者尚未開始打卡，無個人化資料。）"
+    latest = df.sort_values("Date").iloc[-1]
+    yn = lambda v: "✅ 已完成" if bool(v) else "❌ 未完成"
+    return (
+        f"- 最新打卡日期：{latest['Date']}\n"
+        f"- 體重：{float(latest['Weight']):.1f} kg\n"
+        f"- 今日久坐：{float(latest['Sitting_Hours']):.1f} 小時\n"
+        f"- 蛋白質攝取：{float(latest['Protein_g']):.0f} g\n"
+        f"- 飲水量：{float(latest['Water_ml']):.0f} ml\n"
+        f"- 起來走動：{int(latest['Active_Breaks_Count'])} 次\n"
+        f"- 防曬：{yn(latest['Sunscreen_Done'])}\n"
+        f"- 睡眠 > 7 小時：{yn(latest['Good_Sleep_Done'])}\n"
+        f"- 臉部運動：{yn(latest['Face_Exercise_Done'])}\n"
+        f"- 乳液鎖水：{yn(latest['Lotion_Applied_Done'])}\n"
+    )
+
+
+def _call_gemini(
+    api_key: str, model: str, history: list, user_context: str
+) -> str:
+    """以對話歷史 + 個人化資料呼叫 Gemini API，回傳 AI 文字回應。"""
+    # 延遲匯入：缺少套件時不影響整個 app 啟動
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=api_key)
+    system_text = (
+        GEMINI_SYSTEM_PROMPT
+        + "\n\n【使用者最新打卡資料】\n"
+        + user_context
+    )
+
+    contents = [
+        types.Content(
+            role=("user" if m["role"] == "user" else "model"),
+            parts=[types.Part(text=m["content"])],
+        )
+        for m in history
+    ]
+
+    response = client.models.generate_content(
+        model=model,
+        contents=contents,
+        config=types.GenerateContentConfig(system_instruction=system_text),
+    )
+    return response.text or "（AI 未能生成回應，請重試或換個問題。）"
+
+
+def render_ai_advisor(df: pd.DataFrame) -> None:
+    """AI 抗老減重顧問對話介面（使用 Google Gemini API）。"""
+    st.divider()
+    st.header("🤖 AI 抗老減重顧問（Google Gemini）")
+    st.caption(
+        "⚠️ 本顧問由生成式 AI 提供建議，僅供一般保健參考，不能取代專業醫療診斷。"
+        "AI 可能出錯，請以個人健康狀況與專業意見為準。"
+    )
+
+    api_key = _get_gemini_api_key()
+
+    # --- 未設定 API Key：引導設定 ---
+    if not api_key:
+        st.info(
+            "🔑 尚未設定 Gemini API Key。可任選下列其一：\n\n"
+            "- 設定環境變數 `GEMINI_API_KEY`\n"
+            "- 在 `.streamlit/secrets.toml` 加入 `GEMINI_API_KEY = \"...\"`\n"
+            "- 或於下方欄位貼上 API Key（僅儲存於目前瀏覽器 session）"
+        )
+        with st.expander("如何取得 Gemini API Key？"):
+            st.markdown(
+                "1. 前往 Google AI Studio：https://aistudio.google.com/apikey\n"
+                "2. 以 Google 帳號登入後點選「Create API key」\n"
+                "3. 複製產生的 Key，貼到下方欄位即可開始對話\n\n"
+                "免費方案有每日使用額度，正式商用請評估付費方案。"
+            )
+        manual_key = st.text_input(
+            "Gemini API Key",
+            type="password",
+            key="_gemini_key_input",
+            placeholder="貼上 API Key 後按 Enter 送出",
+        )
+        if manual_key:
+            st.session_state["_gemini_key_manual"] = manual_key
+            st.rerun()
+        return
+
+    # --- 有 API Key：模型選擇 + 對話介面 ---
+    top_cols = st.columns([3, 1, 1])
+    with top_cols[0]:
+        model_label = st.selectbox(
+            "模型",
+            options=list(GEMINI_MODELS.keys()),
+            format_func=lambda k: GEMINI_MODELS[k],
+            key="_gemini_model",
+        )
+    with top_cols[1]:
+        st.write("")  # 對齊按鈕高度
+        if st.button("🔄 清除對話", use_container_width=True):
+            st.session_state["ai_history"] = []
+            st.rerun()
+    with top_cols[2]:
+        st.write("")
+        # 僅當 Key 來自手動輸入時，才顯示重設 Key 按鈕
+        if st.session_state.get("_gemini_key_manual") and st.button(
+            "🔑 重設 Key", use_container_width=True
+        ):
+            st.session_state.pop("_gemini_key_manual", None)
+            st.session_state["ai_history"] = []
+            st.rerun()
+
+    # 初始化對話歷史
+    if "ai_history" not in st.session_state:
+        st.session_state["ai_history"] = []
+
+    # 顯示既有對話
+    for msg in st.session_state["ai_history"]:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    # 接收新輸入
+    user_input = st.chat_input(
+        "輸入你的健康減重或抗老問題，例如：「我 45 歲想瘦小腹該怎麼吃？」"
+    )
+    if user_input:
+        st.session_state["ai_history"].append(
+            {"role": "user", "content": user_input}
+        )
+        with st.chat_message("user"):
+            st.markdown(user_input)
+
+        with st.chat_message("assistant"):
+            with st.spinner("AI 思考中..."):
+                try:
+                    reply = _call_gemini(
+                        api_key,
+                        model_label,
+                        st.session_state["ai_history"],
+                        _build_user_context(df),
+                    )
+                except ModuleNotFoundError:
+                    reply = (
+                        "❌ 尚未安裝 Gemini 套件。請執行：`pip install google-genai`"
+                        " 後重啟應用程式。"
+                    )
+                except Exception as e:
+                    reply = (
+                        f"❌ 呼叫 Gemini API 失敗：`{type(e).__name__}: {e}`\n\n"
+                        "請檢查 API Key 是否正確、網路連線、配額是否足夠，或稍後再試。"
+                    )
+            st.markdown(reply)
+
+        st.session_state["ai_history"].append(
+            {"role": "assistant", "content": reply}
+        )
+
+
+# ---------------------------------------------------------------------------
 # 程式進入點
 # ---------------------------------------------------------------------------
 def main() -> None:
@@ -707,6 +903,8 @@ def main() -> None:
     render_face_exercise_guide()
     # 健康保養與抗下垂建議：營養素、胸／臀運動、生活原則
     render_wellness_guide()
+    # AI 抗老減重顧問：使用 Google Gemini，依使用者最新打卡資料給個人化建議
+    render_ai_advisor(df)
 
 
 if __name__ == "__main__":

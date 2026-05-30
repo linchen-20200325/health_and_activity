@@ -417,7 +417,6 @@ def render_face_exercise_guide() -> None:
 # 以下數值整合自衛福部國健署「國人膳食營養素參考攝取量 (DRIs) 第八版」、
 # USDA Dietary Reference Intakes、WHO 飲食指引等公開資料；皆為「成人女性」一般參考值，
 # 個別情況請依專業評估調整。
-AGE_GROUPS = ["18–30 歲", "31–50 歲", "51–65 歲", "65 歲以上"]
 
 # 蛋白質欄位以「每公斤體重」表示；其餘為當日總攝取量
 NUTRIENT_TABLE = {

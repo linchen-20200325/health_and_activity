@@ -113,6 +113,28 @@ def save_data(df: pd.DataFrame, new_row: dict) -> pd.DataFrame:
     return combined
 
 
+def upsert_weight(df: pd.DataFrame, input_date: date, weight: float) -> pd.DataFrame:
+    """
+    僅儲存體重的快速更新：若該日已有完整打卡紀錄，保留其他欄位、只覆寫 Weight；
+    若該日尚無紀錄，建立新列並以各欄位預設值填補（避免破壞既有資料）。
+    """
+    date_str = input_date.strftime("%Y-%m-%d")
+    existing = df[df["Date"] == date_str]
+    if not existing.empty:
+        row = existing.iloc[0].to_dict()
+        row["Weight"] = float(weight)
+    else:
+        row = {
+            col: (False if col in BOOLEAN_COLUMNS
+                  else 0 if col in COUNT_COLUMNS
+                  else 0.0)
+            for col in ALL_COLUMNS
+        }
+        row["Date"] = date_str
+        row["Weight"] = float(weight)
+    return save_data(df, row)
+
+
 # ---------------------------------------------------------------------------
 # 側邊欄：今日抗老打卡表單
 # ---------------------------------------------------------------------------
@@ -186,11 +208,81 @@ def render_sidebar(df: pd.DataFrame) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 主畫面：體重快速儲存與趨勢
+# ---------------------------------------------------------------------------
+def render_weight_tracker(df: pd.DataFrame) -> None:
+    """
+    主畫面的「快速儲存體重 + 趨勢圖表」區塊。
+    - 左：只需輸入日期與體重即可儲存，不必填整張側邊欄表單。
+    - 右：起始 / 目前 / 最低三項統計與變化量。
+    - 下方：體重趨勢折線圖，無資料時顯示提示文字。
+    """
+    st.header("⚖️ 體重快速儲存與趨勢")
+
+    col_form, col_stat = st.columns([1, 1])
+
+    with col_form:
+        with st.form("quick_weight", clear_on_submit=False):
+            qw_date = st.date_input("日期", value=date.today(), key="qw_date")
+            qw_weight = st.number_input(
+                "體重 (kg)",
+                min_value=30.0,
+                max_value=200.0,
+                value=60.0,
+                step=0.1,
+                key="qw_weight",
+            )
+            qw_submit = st.form_submit_button("💾 儲存體重")
+        if qw_submit:
+            upsert_weight(df, qw_date, float(qw_weight))
+            st.success(
+                f"✅ 已儲存 {qw_date.strftime('%Y-%m-%d')} 體重：{qw_weight:.1f} kg"
+            )
+            st.rerun()
+
+    # 只取有效（>0）的體重紀錄，避免快速建立的空殼列污染統計與圖表
+    valid = (
+        df[df["Weight"] > 0][["Date", "Weight"]].sort_values("Date")
+        if not df.empty
+        else pd.DataFrame(columns=["Date", "Weight"])
+    )
+
+    with col_stat:
+        if valid.empty:
+            st.info("📝 尚無體重紀錄，於左側輸入後即可看到趨勢與統計。")
+        else:
+            first = float(valid.iloc[0]["Weight"])
+            latest = float(valid.iloc[-1]["Weight"])
+            lowest = float(valid["Weight"].min())
+            delta = latest - first
+            s1, s2, s3 = st.columns(3)
+            s1.metric("起始體重", f"{first:.1f} kg")
+            s2.metric(
+                "目前體重",
+                f"{latest:.1f} kg",
+                delta=f"{delta:+.1f} kg",
+                delta_color="inverse",
+            )
+            s3.metric("最低紀錄", f"{lowest:.1f} kg")
+
+    if not valid.empty:
+        chart_df = valid.set_index("Date")
+        st.line_chart(chart_df["Weight"], height=280)
+    else:
+        st.caption("📈 尚無資料可繪製圖表，儲存第一筆體重後即會自動顯示。")
+
+    st.divider()
+
+
+# ---------------------------------------------------------------------------
 # 主畫面：儀表板
 # ---------------------------------------------------------------------------
 def render_dashboard(df: pd.DataFrame) -> None:
     """繪製主畫面儀表板內容。"""
     st.title("✨ 緊實身材與抗下垂：每日打卡儀表板")
+
+    # 體重快速儲存與趨勢圖表：無論是否有資料皆顯示，讓使用者隨時能存體重看圖
+    render_weight_tracker(df)
 
     # 空資料狀態
     if df.empty:
